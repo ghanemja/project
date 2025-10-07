@@ -13,31 +13,37 @@ import json, time, pathlib, requests, re, threading, base64
 OLLAMA_URL = os.environ.get("OLLAMA_URL", os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")).rstrip("/")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llava-llama3:latest")
 LLAVA_URL = os.environ.get("LLAVA_URL")  # optional, e.g. "http://localhost:8000/infer"
-
 VLM_SYSTEM_PROMPT = """You are a visual large language model assisting with 3D CAD model editing.
 
 Context:
 - The model is a parametric robot rover built in CadQuery / cqparts.
-- The UI provides a list of *component classes* and the user's optional *selected class*.
-- The user may also provide a reference image that shows the desired result.
+- The UI provides a list of component classes and the optional selected class.
+- The user may provide a reference image; if present, propose changes that make the CAD better match that image (be conservative, but concrete).
 
-Your task:
-- Interpret the user's intent using the components list and (if present) the image.
-- Propose parametric changes that can be applied to the CAD model.
-- Be conservative if uncertain.
-
-Response format (strict JSON only):
+Response format (strict JSON only). You may return a SINGLE change object, or a LIST of change objects:
 {
-  "target_component": "<component_class_or_specific_name>",
+  "target_component": "<component_class_or_specific_name_or_new_type>",
   "action": "<modify|replace|resize|rotate|translate|delete|add>",
   "parameters": { "field": "value", "field2": "value2" },
   "rationale": "one brief sentence"
 }
 
-Rules:
-- Output STRICT JSON, no extra commentary.
+Rules for 'add':
+- Use "target_component": the class/type to add, e.g., "wheel".
+- Put necessary fields in "parameters" such as:
+  - "count": integer (e.g., 2 to add one wheel on each side, or 6 total),
+  - "wheels_per_side": integer (e.g., 3),
+  - "positions_mm": optional array of X/Y/Z triplets (mm) if you want explicit placements,
+  - or "axle_count": integer plus "axle_spacing_mm".
+- If unsure about exact values, set them to null but keep the key so the UI can prompt later.
+
+General Rules:
+- Output STRICT JSON (no prose).
+- If you return multiple proposals, respond with a JSON array of objects.
 - If unsure, set ambiguous fields to null and explain briefly in 'rationale'.
 """
+
+
 
 # --------------------------- CQ v1 → v2 SHIMS ---------------------------
 import cadquery as cq
@@ -93,6 +99,9 @@ CURRENT_PARAMS: Dict[str, Optional[float]] = {
     "pan_tilt_offset_x": None,
     "pan_tilt_offset_y": None,
     "pan_tilt_offset_z": None,
+    "wheels_per_side": None,       # e.g., 3  (=> total wheels = 2 * wheels_per_side)
+    "axle_spacing_mm": None,       # spacing between wheel centers along X or Y
+    "wheelbase_span_mm": None,   
 }
 HISTORY: list[Dict[str, Optional[float]]] = []
 H_PTR: int = -1  # -1 means empty
@@ -141,6 +150,22 @@ def apply_params_to_rover(rv, params: Dict[str, Any] | None):
     except Exception:
         pass
 
+    # Wheels per side (adds wheels)
+    try:
+        if CURRENT_PARAMS["wheels_per_side"] is not None:
+            setattr(Rover, "wheels_per_side", int(CURRENT_PARAMS["wheels_per_side"]))
+    except Exception:
+        pass
+
+    # Spacing controls
+    for k in ("axle_spacing_mm","wheelbase_span_mm"):
+        try:
+            if CURRENT_PARAMS[k] is not None:
+                setattr(Rover, k, float(CURRENT_PARAMS[k]))
+        except Exception:
+            pass
+
+
     try:
         for axis in ("x", "y", "z"):
             key = f"pan_tilt_offset_{axis}"
@@ -158,6 +183,13 @@ HTML = """
   :root{--bar:54px;--sidebar:320px;--right:380px;--console:150px}
   *{box-sizing:border-box}
   html,body{margin:0;height:100%;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  /* Collapse whole panels by zeroing the CSS vars already used by layout */
+  body.left-collapsed  { --sidebar: 0px; }
+  body.right-collapsed { --right:   0px; }
+
+  /* Optional: remove borders when hidden */
+  body.left-collapsed  #left  { border-right: none; }
+  body.right-collapsed #right { border-left:  none; }
   #bar{position:fixed;top:0;left:0;right:0;height:var(--bar);display:flex;gap:10px;align-items:center;padding:8px 12px;border-bottom:1px solid #eee;background:#fff;z-index:10}
   #left{position:fixed;top:var(--bar);left:0;bottom:var(--console);width:var(--sidebar);border-right:1px solid #eee;background:#fafafa;overflow:auto}
   #left h3,#right h3{margin:10px 12px;font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:#666}
@@ -171,6 +203,11 @@ HTML = """
   #canvas{width:100%;height:100%;display:block}
   #right{position:fixed;top:var(--bar);right:0;bottom:var(--console);width:var(--right);border-left:1px solid #eee;background:#fff;display:flex;flex-direction:column;overflow:auto}
   .section{padding:10px 12px;border-bottom:1px solid #f0f0f0}
+  .section header{display:flex;align-items:center;gap:8px}
+  .section header h3{margin:0;font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:#666}
+  .section header .toggle{margin-left:auto;border:1px solid #ddd;background:#fff;border-radius:8px;padding:4px 8px;cursor:pointer;font-size:12px}
+  .section header .toggle:hover{background:#f8fafc}
+  .section.collapsed .section-body{display:none}
   .row{display:flex;align-items:center;gap:10px;margin:6px 0;flex-wrap:wrap}
   .row label{font-size:12px;color:#334155;min-width:90px}
   .row input[type=range]{flex:1 1 160px}
@@ -197,62 +234,87 @@ HTML = """
 <div id="bar">
   <button id="reload">Reload Model</button>
   <button id="clear">Clear Selection</button>
+  <button id="suggestFromImage" class="btn">Suggest from image</button>
   <span>Selected:</span> <span id="name">—</span>
   <span id="log" style="margin-left:12px"></span>
   <span id="tools" style="margin-left:auto">
+      <!-- inside #bar, anywhere convenient -->
+    <label><input type="checkbox" id="toggleLeftPanel" title="Show/Hide Camera panel" checked> Show Camera panel</label>
+    <label><input type="checkbox" id="toggleRightPanel" title="Show/Hide Components panel" checked> Show Components panel</label>
     <label><input type="checkbox" id="toggleLabels" checked> Show labels</label>
     <button id="fitAll" class="btn">Fit All</button>
   </span>
   <span class="pill" id="modeHint" style="margin-left:8px"></span>
 </div>
 
+<!-- LEFT: Camera (moved here) -->
 <div id="left">
-  <h3 style="margin-top:3rem">Components</h3>
-  <ul id="compList"></ul>
+  <div class="section" id="sectionCamera">
+    <header>
+      <h3>Camera</h3>
+      <button class="toggle" data-target="sectionCamera">Collapse</button>
+    </header>
+    <div class="section-body">
+      <div class="row"><label>FOV</label><input id="fov" type="range" min="20" max="90" value="50"><span id="fovVal" class="pill">50°</span></div>
+      <div class="row"><label>Near</label><input id="near" type="number" value="0.01" step="0.01"><label>Far</label><input id="far" type="number" value="5000" step="10"></div>
+      <div class="row"><label>Damping</label><input id="damping" type="range" min="0" max="100" value="8"><span id="dampVal" class="pill">0.08</span></div>
+      <div class="row"><label>Rotate Spd</label><input id="rotSpd" type="range" min="10" max="300" value="100"><span id="rotVal" class="pill">1.00</span></div>
+      <div class="row"><label>Zoom Spd</label><input id="zoomSpd" type="range" min="10" max="300" value="100"><span id="zoomVal" class="pill">1.00</span></div>
+      <div class="row"><label>Pan Spd</label><input id="panSpd" type="range" min="10" max="300" value="100"><span id="panVal" class="pill">1.00</span></div>
+      <div class="row">
+        <button id="viewIso">Iso</button>
+        <button id="viewTop">Top</button>
+        <button id="viewFront">Front</button>
+        <button id="viewRight">Right</button>
+        <button id="rotLeft">⟲ 90°</button>
+        <button id="rotRight">⟳ 90°</button>
+        <button id="resetCam">Reset</button>
+        <label style="margin-left:auto"><input type="checkbox" id="lockTarget"> Lock to selection</label>
+      </div>
+      <div class="row">
+        <label><input type="checkbox" id="gridToggle" checked> Grid</label>
+        <label><input type="checkbox" id="axesToggle" checked> Axes</label>
+      </div>
+    </div>
+  </div>
 </div>
 
 <div id="wrap"><canvas id="canvas"></canvas></div>
 
+<!-- RIGHT: Components (moved here) + VLM Prompt -->
 <div id="right">
-  <div class="section">
-    <h3>Camera</h3>
-    <div class="row"><label>FOV</label><input id="fov" type="range" min="20" max="90" value="50"><span id="fovVal" class="pill">50°</span></div>
-    <div class="row"><label>Near</label><input id="near" type="number" value="0.01" step="0.01"><label>Far</label><input id="far" type="number" value="5000" step="10"></div>
-    <div class="row"><label>Damping</label><input id="damping" type="range" min="0" max="100" value="8"><span id="dampVal" class="pill">0.08</span></div>
-    <div class="row"><label>Rotate Spd</label><input id="rotSpd" type="range" min="10" max="300" value="100"><span id="rotVal" class="pill">1.00</span></div>
-    <div class="row"><label>Zoom Spd</label><input id="zoomSpd" type="range" min="10" max="300" value="100"><span id="zoomVal" class="pill">1.00</span></div>
-    <div class="row"><label>Pan Spd</label><input id="panSpd" type="range" min="10" max="300" value="100"><span id="panVal" class="pill">1.00</span></div>
-    <div class="row">
-      <button id="viewIso">Iso</button>
-      <button id="viewTop">Top</button>
-      <button id="viewFront">Front</button>
-      <button id="viewRight">Right</button>
-      <button id="rotLeft">⟲ 90°</button>
-      <button id="rotRight">⟳ 90°</button>
-      <button id="resetCam">Reset</button>
-      <label style="margin-left:auto"><input type="checkbox" id="lockTarget"> Lock to selection</label>
-    </div>
-    <div class="row">
-      <label><input type="checkbox" id="gridToggle" checked> Grid</label>
-      <label><input type="checkbox" id="axesToggle" checked> Axes</label>
+  <div class="section" id="sectionComponents">
+    <header>
+      <h3>Components</h3>
+      <button class="toggle" data-target="sectionComponents">Collapse</button>
+    </header>
+    <div class="section-body">
+      <ul id="compList"></ul>
     </div>
   </div>
 
-  <div class="section">
-    <h3>VLM Prompt</h3>
-    <div class="row" style="flex-direction:column; align-items:stretch">
-      <textarea id="prompt" placeholder="Describe the change you want (e.g., 'Increase wheel diameter by 10% and move the pan-tilt 20mm forward')"></textarea>
+  <div class="section" id="vlmSection">
+    <header>
+      <h3>VLM Prompt</h3>
+      <button class="toggle" data-target="vlmSection">Collapse</button>
+    </header>
+    <div class="section-body">
+      <div class="row" style="flex-direction:column; align-items:stretch">
+        <textarea id="prompt" placeholder="Describe the change you want (e.g., 'Increase wheel diameter by 10% and move the pan-tilt 20mm forward')"></textarea>
+      </div>
+      <div class="row">
+        <input id="imgFile" type="file" accept="image/*">
+        <button id="clearImg">Clear Image</button>
+      </div>
+      <div class="row"><img id="imgPreview" alt="Reference preview (optional)"></div>
+      <div class="row">
+        <button id="insertSelected">Insert selected</button>
+        <button id="sendVLM" style="margin-left:auto">Send to VLM</button>
+      </div>
+      <!-- chips live here now -->
+      <div id="chips" style="margin-top:6px"></div>
+      <div id="vlmNotice" style="font-size:12px;color:#64748b"></div>
     </div>
-    <div class="row">
-      <input id="imgFile" type="file" accept="image/*">
-      <button id="clearImg">Clear Image</button>
-    </div>
-    <div class="row"><img id="imgPreview" alt="Reference preview (optional)"></div>
-    <div class="row">
-      <button id="insertSelected">Insert selected</button>
-      <button id="sendVLM" style="margin-left:auto">Send to VLM</button>
-    </div>
-    <div id="vlmNotice" style="font-size:12px;color:#64748b"></div>
   </div>
 </div>
 
@@ -271,20 +333,129 @@ HTML = """
   import { OrbitControls } from '/static/jsm/controls/OrbitControls.js';
   import { GLTFLoader } from '/static/jsm/loaders/GLTFLoader.js';
 
+  // ---- Collapsible helpers ----
+  function restoreCollapsedState(){
+    document.querySelectorAll('.section').forEach(sec=>{
+      const id = sec.id; if(!id) return; const collapsed = localStorage.getItem('sec:'+id)==='1';
+      sec.classList.toggle('collapsed', collapsed);
+      const btn = sec.querySelector('.toggle'); if(btn) btn.textContent = collapsed ? 'Expand' : 'Collapse';
+    });
+  }
+  function setupToggles(){
+    document.querySelectorAll('.section .toggle').forEach(btn=>{
+      btn.addEventListener('click',()=>{
+        const target = btn.dataset.target; const sec = document.getElementById(target);
+        if(!sec) return; const now = !sec.classList.contains('collapsed');
+        sec.classList.toggle('collapsed', now);
+        btn.textContent = now ? 'Expand' : 'Collapse';
+        localStorage.setItem('sec:'+target, now ? '1':'0');
+      });
+    });
+    restoreCollapsedState();
+  }
+
+  const suggestBtn = document.getElementById('suggestFromImage');
+
+  async function snapshotCanvasToBlob() {
+    const canvas = document.getElementById('canvas');
+    return await new Promise(res => canvas.toBlob(b => res(b), 'image/png', 0.9));
+  }
+
+  suggestBtn.onclick = async () => {
+    try {
+      const data = new FormData();
+      if (imgFile.files?.[0]) data.append('reference', imgFile.files[0]);
+      else { vlmNotice.textContent = 'Select a reference image first.'; vlmNotice.style.color='#b45309'; return; }
+
+      const snapBlob = await snapshotCanvasToBlob();
+      if (snapBlob) data.append('snapshot', new File([snapBlob], 'snapshot.png', { type: 'image/png' }));
+
+      data.append('classes', JSON.stringify([...classMap.keys()]));
+      data.append('prompt', promptEl.value || '');
+
+      const r = await fetch('/recommend', { method:'POST', body:data });
+      if(!r.ok) throw new Error('recommend HTTP '+r.status);
+      const js = await r.json();
+      const recs = js?.response?.json;
+
+      if (!recs) { logLine('No structured suggestions returned.', 'warn'); return; }
+
+      const changes = Array.isArray(recs) ? recs : [recs];
+      for (const ch of changes) {
+        await applyVLMJson(ch);
+      }
+    } catch(e){
+      logLine(String(e), 'err');
+    }
+  };
+
+  function sceneBasis(){
+    const up = new THREE.Vector3(0,1,0);
+    const camDir = new THREE.Vector3(); camera.getWorldDirection(camDir);
+    const right = new THREE.Vector3().crossVectors(camDir, up).normalize();
+    const upFace = new THREE.Vector3().crossVectors(right, camDir).normalize(); // camera-facing up
+    return {right, up: upFace};
+  }
+
+  function project2(basis, v, origin){
+    const p = v.clone().sub(origin);
+    return { x: p.dot(basis.right), y: p.dot(basis.up) };
+  }
+
+
   // --- tiny text label sprite helper ---
-  function makeTextSprite(text){
+  // replace old makeTextSprite
+  function makeTextSprite(text, {fontSize=128, pad=16, worldScale=0.5}={}){
     const cvs=document.createElement('canvas'); const ctx=cvs.getContext('2d');
-    const pad=6; const fs=24; ctx.font = `${fs}px system-ui,-apple-system,Segoe UI,Roboto,sans-serif`;
-    const w=Math.ceil(ctx.measureText(text).width)+pad*2, h=fs+pad*2;
-    cvs.width=w*2; cvs.height=h*2; const g=cvs.getContext('2d'); g.scale(2,2);
-    g.fillStyle='rgba(255,255,255,0.92)'; g.strokeStyle='rgba(0,0,0,0.14)';
-    g.lineWidth=1; g.beginPath();
-    const r=6; g.roundRect?g.roundRect(0,0,w,h,r):(g.rect(0,0,w,h)); g.fill(); g.stroke();
-    g.fillStyle='#111'; g.font   = `${fs}px system-ui,-apple-system,Segoe UI,Roboto,sans-serif`; g.textBaseline='middle'; g.fillText(text,pad,h/2);
+    ctx.font = `${fontSize}px system-ui,-apple-system,Segoe UI,Roboto,sans-serif`;
+    const w=Math.ceil(ctx.measureText(text).width)+pad*2, h=fontSize+pad*2;
+    cvs.width=w*2; cvs.height=h*2;
+    const g=cvs.getContext('2d'); g.scale(2,2);
+    g.fillStyle='rgba(255,255,255,0.96)'; g.strokeStyle='rgba(0,0,0,0.18)';
+    g.lineWidth=1.2; g.beginPath();
+    const r=8; g.roundRect?g.roundRect(0,0,w,h,r):g.rect(0,0,w,h); g.fill(); g.stroke();
+    g.fillStyle='#0f172a'; g.font=`${fontSize}px system-ui,-apple-system,Segoe UI,Roboto,sans-serif`;
+    g.textBaseline='middle'; g.fillText(text,pad,h/2);
+
     const tex=new THREE.CanvasTexture(cvs); tex.needsUpdate=true;
     const mat=new THREE.SpriteMaterial({map:tex, depthTest:false});
-    const spr=new THREE.Sprite(mat); spr.scale.set(w*0.01,h*0.01,1); spr.renderOrder=999; return spr;
+    const spr=new THREE.Sprite(mat);
+    spr.scale.set(w*worldScale,h*worldScale,1);
+    spr.renderOrder=999;
+    return spr;
   }
+    function buildLabelCallout(key, center, bboxDiag){
+    const group = new THREE.Group();
+
+    // offset diagonally (up + camera-right) proportional to model size
+    const up = new THREE.Vector3(0,1,0);
+    const camDir = new THREE.Vector3(); camera.getWorldDirection(camDir);
+    const right = new THREE.Vector3().crossVectors(camDir, up).normalize();
+    const offLen = Math.max(0.8*bboxDiag, 12);     // world units
+    const labelPos = center.clone()
+      .add(up.clone().multiplyScalar(offLen*0.9))
+      .add(right.clone().multiplyScalar(offLen*0.8));
+
+    // sprite (bigger)
+    const spr = makeTextSprite(key, {fontSize:50, worldScale:0.18});
+    spr.position.copy(labelPos);
+    group.add(spr);
+
+    // leader line
+    const geom = new THREE.BufferGeometry().setFromPoints([labelPos, center]);
+    const line = new THREE.Line(geom, new THREE.LineBasicMaterial({color:0x0f172a}));
+    group.add(line);
+
+    // arrow head at the center pointing toward label
+    const dir = labelPos.clone().sub(center).normalize();
+    const len = Math.max(0.06*bboxDiag, 6);
+    const arrow = new THREE.ArrowHelper(dir, center, len, 0x0f172a, /*headLength*/ len*0.55, /*headWidth*/ len*0.35);
+    group.add(arrow);
+
+    return {group, sprite:spr, line, arrow};
+  }
+
+
 
   const canvas=document.getElementById('canvas');
   const renderer=new THREE.WebGLRenderer({canvas,antialias:true});
@@ -329,7 +500,8 @@ HTML = """
   const btnRedo = document.getElementById('btnRedo');
 
   // VLM panel
-  const promptEl=document.getElementById('prompt'), chips=document.getElementById('chips') || document.createElement('div');
+  const promptEl=document.getElementById('prompt');
+  const chips=document.getElementById('chips');
   const imgFile=document.getElementById('imgFile'), imgPreview=document.getElementById('imgPreview'), clearImg=document.getElementById('clearImg');
   const insertSelected=document.getElementById('insertSelected'), sendVLM=document.getElementById('sendVLM'), vlmNotice=document.getElementById('vlmNotice');
 
@@ -391,7 +563,7 @@ HTML = """
     const box=new THREE.Box3().setFromObject(pivot);
     const len=box.getSize(new THREE.Vector3()).length();
     const c=box.getCenter(new THREE.Vector3());
-    camera.near=Math.max(0.01,len/200); camera.far=len*10; camera.updateProjectionMatrix();
+    camera.near=Math.max(0.01,len/200); camera.far=len*15; camera.updateProjectionMatrix();
     camera.position.copy(c).add(new THREE.Vector3(0.6*len,0.45*len,0.9*len));
     camera.lookAt(c); controls.target.copy(c);
   }
@@ -427,17 +599,27 @@ HTML = """
   }
 
   function placeLabels(){
-    classMap.forEach(e=>{ if(e.label){ pivot.remove(e.label); e.label=null; } });
-    if(!document.getElementById('toggleLabels').checked) return;
-    classMap.forEach((entry,key)=>{
-      const box=new THREE.Box3(); entry.nodes.forEach(n=> box.union(new THREE.Box3().setFromObject(n)));
-      const c=box.getCenter(new THREE.Vector3());
-      const spr=makeTextSprite(`${key}`);
-      spr.position.copy(c).add(new THREE.Vector3(0, box.getSize(new THREE.Vector3()).y*0.05+0.01, 0));
-      pivot.add(spr); entry.label=spr;
+    // remove old labels
+    classMap.forEach(e => { if (e.label){ pivot.remove(e.label); e.label = null; } });
+    if (!document.getElementById('toggleLabels').checked) return;
+
+    // place one centered sprite per component class (no arrows/lines)
+    classMap.forEach((entry, key) => {
+      // compute this class' bounding box & center
+      const box = new THREE.Box3();
+      entry.nodes.forEach(n => box.union(new THREE.Box3().setFromObject(n)));
+      const c = box.getCenter(new THREE.Vector3());
+      const sz = box.getSize(new THREE.Vector3());
+      const lift = Math.max(0.02*sz.y, 0.6);  // tiny vertical lift to avoid z-fighting
+
+      // make a bigger text sprite and position at component center (+ small lift)
+      const spr = makeTextSprite(key, { fontSize: 56, worldScale: 0.1, pad: 18 });
+      spr.position.copy(c).add(new THREE.Vector3(0, lift, 0));
+
+      pivot.add(spr);
+      entry.label = spr;
     });
   }
-
   function colorizeByClass(){
     if(group) restoreNode(group);
     classMap.forEach(entry=> entry.nodes.forEach(node=> paintNode(node, entry.color, null, 1)));
@@ -454,8 +636,7 @@ HTML = """
       li.onclick=()=> selectClass(key,true);
       compList.appendChild(li);
     });
-    // optional chips
-    if (chips && !chips.parentElement) { document.querySelector('#right .section').appendChild(chips); }
+    // chips live near VLM prompt now
     chips.innerHTML='';
     classMap.forEach((_,key)=>{
       const c=document.createElement('span'); c.className='chip'; c.textContent=key; c.title='Insert into prompt';
@@ -464,6 +645,43 @@ HTML = """
     });
     adjustColumns();
   }
+
+  function frameBox(box, {pad=1.25, duration=420} = {}){
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z);
+
+    // compute distance from FOV (vertical)
+    const fov = THREE.MathUtils.degToRad(camera.fov);
+    const dist = (maxDim * pad) / (2 * Math.tan(fov / 2));
+
+    // keep current azimuth/elevation: ray from center opposite current view dir
+    const viewDir = new THREE.Vector3();
+    camera.getWorldDirection(viewDir); // points from camera -> scene
+    const targetPos = center.clone().sub(viewDir.clone().normalize().multiplyScalar(dist));
+
+    // robust near/far
+    camera.near = Math.max(0.01, maxDim/200);
+    camera.far  = Math.max(camera.near+1, dist + maxDim*10);
+    camera.updateProjectionMatrix();
+
+    // animate cam+target
+    const startPos = camera.position.clone();
+    const startTgt = controls.target.clone();
+    const endPos   = targetPos;
+    const endTgt   = center.clone();
+    const t0 = performance.now();
+
+    function tick(now){
+      const t = Math.min(1, (now - t0) / duration);
+      const e = t<0.5 ? 2*t*t : -1+(4-2*t)*t; // easeInOutQuad
+      camera.position.lerpVectors(startPos, endPos, e);
+      controls.target.lerpVectors(startTgt, endTgt, e);
+      if (t < 1) requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  }
+
 
   function selectClass(key, zoom=false){
     if(selectedClass && classMap.has(selectedClass)){
@@ -475,12 +693,10 @@ HTML = """
       const entry=classMap.get(selectedClass);
       entry.nodes.forEach(node=> paintNode(node, entry.color, selectEmissive, 0.85));
       nameEl.textContent=selectedClass;
-      if(zoom){
-        const box=new THREE.Box3(); entry.nodes.forEach(n=> box.union(new THREE.Box3().setFromObject(n)));
-        const len=box.getSize(new THREE.Vector3()).length(); const c=box.getCenter(new THREE.Vector3());
-        camera.near=Math.max(0.01,len/200); camera.far=len*10; camera.updateProjectionMatrix();
-        camera.position.copy(c).add(new THREE.Vector3(0.5*len,0.35*len,0.75*len));
-        if(lockTarget.checked) controls.target.copy(c);
+      if (zoom){
+        const box=new THREE.Box3();
+        entry.nodes.forEach(n=> box.union(new THREE.Box3().setFromObject(n)));
+        frameBox(box, {pad:1.3, duration:450});   // center & zoom to part
       }
       [...compList.children].forEach(li=> li.classList.toggle('active', li.dataset.key===selectedClass));
     }else{
@@ -519,7 +735,10 @@ HTML = """
     const loader=new GLTFLoader(); const url='/model.glb?ts='+Date.now();
     logLine('Loading model…');
     await new Promise((res,rej)=> loader.load(url, g=>{
-      group=g.scene; setDefaultIfMissing(group); pivot.add(group);
+      group = g.scene;
+      group.rotation.x = -Math.PI / 2;   // Z-up → Y-up
+      setDefaultIfMissing(group);
+      pivot.add(group);
       buildClassRegistry(group); colorizeByClass(); placeLabels(); syncSidebar(); fit(); saveBaselineCam(); res();
       logLine('Model loaded.');
     }, undefined, (err)=>{ logLine('GLTF load error: '+String(err),'err'); rej(err); }));
@@ -547,7 +766,12 @@ HTML = """
   viewTop.onclick=()=> quickView(new THREE.Vector3(0,1,0.0001));
   viewFront.onclick=()=> quickView(new THREE.Vector3(0,0,1));
   viewRight.onclick=()=> quickView(new THREE.Vector3(1,0,0));
-  resetCam.onclick=()=> restoreBaselineCam();
+  resetCam.onclick = ()=>{
+    restoreBaselineCam();
+    // optional: also re-center orbit pivot
+    controls.target.copy(baselineCam?.target || new THREE.Vector3());
+  };
+
   rotLeft.onclick=()=> { pivot.rotateY(+Math.PI/2); };
   rotRight.onclick=()=> { pivot.rotateY(-Math.PI/2); };
   fitAllBtn.onclick=()=>{ if(group) fit(); };
@@ -591,8 +815,8 @@ HTML = """
     if(!js.ok){ throw new Error(js.error||'apply failed'); }
 
     logLine(`Applied ${jsonObj.action||'modify'} ${jsonObj.target_component||''} ${JSON.stringify(jsonObj.parameters||{})}`);
-    await loadModel();             // new GLB
-    await refreshParamsHint();     // show new params
+    await loadModel();
+    await refreshParamsHint();
     const key = js.highlight_key || jsonObj.target_component || '';
     if(key) selectClass(key, true);
 
@@ -666,12 +890,36 @@ HTML = """
     else { logLine(`Redo failed: ${js.error||'unknown'}`, 'err'); }
   };
 
+    // --- Whole-panel collapse/restore with persistence ---
+  function applyPanelState() {
+    const leftCollapsed  = localStorage.getItem('panel:left')  === '1';
+    const rightCollapsed = localStorage.getItem('panel:right') === '1';
+    document.body.classList.toggle('left-collapsed',  leftCollapsed);
+    document.body.classList.toggle('right-collapsed', rightCollapsed);
+  }
+  function togglePanel(which) {
+    const key = which === 'left' ? 'panel:left' : 'panel:right';
+    const now = localStorage.getItem(key) === '1' ? '0' : '1';
+    localStorage.setItem(key, now);
+    applyPanelState();
+    // ensure canvas resizes properly
+    window.dispatchEvent(new Event('resize'));
+  }
+
+    // wire buttons (place after DOM is ready / in start())
+  document.getElementById('toggleLeftPanel').onclick  = () => togglePanel('left');
+  document.getElementById('toggleRightPanel').onclick = () => togglePanel('right');
+
   document.getElementById('reload').onclick=()=> loadModel().catch(e=> logLine(String(e),'err'));
   document.getElementById('clear').onclick=()=> selectClass(null);
+
 
   function animate(){ resize(); updateHover(); controls.update(); renderer.render(scene,camera); requestAnimationFrame(animate); }
 
   (async function start(){
+  // call once during init (e.g., at top of start())
+    applyPanelState();
+    setupToggles();
     animate();
     await getMode();
     adjustColumns();
@@ -760,6 +1008,56 @@ def label():
 def labels():
     return jsonify({"ok": True, "selected_parts": STATE["selected_parts"]})
 
+@app.post("/recommend")
+def recommend():
+    try:
+        # optional user free-text prompt
+        prompt = (request.form.get("prompt") or "").strip()
+        classes = request.form.get("classes") or "[]"
+        try:
+            classes = json.loads(classes)
+            if not isinstance(classes, list): classes = []
+        except Exception:
+            classes = []
+
+        # reference image is required for this endpoint
+        ref_url = _data_url_from_upload(request.files.get("reference"))
+        if not ref_url:
+            return jsonify({"ok": False, "error": "no reference image"}), 400
+
+        # optional current snapshot (canvas sent from client)
+        snapshot_url = _data_url_from_upload(request.files.get("snapshot"))
+
+        grounding = []
+        grounding.append("Goal: Propose parametric changes so CAD matches the reference image better.")
+        grounding.append("Known classes:")
+        grounding += [f"- {c}" for c in classes]
+        if prompt:
+            grounding.append("\nUser prompt:\n" + prompt)
+        if snapshot_url:
+            grounding.append("\nA second image is the current CAD snapshot (for comparison).")
+
+        final_prompt = f"{VLM_SYSTEM_PROMPT}\n\n---\n" + "\n".join(grounding)
+
+        # concatenate images; Ollama supports multiple images
+        provider_out = call_vlm(final_prompt, ref_url if not snapshot_url else ref_url)
+        raw = provider_out.get("raw", "")
+
+        # try strict JSON, or last {...}
+        parsed = None
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            m = re.search(r"\[[\s\S]*\]\s*$|\{[\s\S]*\}\s*$", raw.strip())
+            if m:
+                try: parsed = json.loads(m.group(0))
+                except Exception: parsed = None
+
+        return jsonify({"ok": True, "response": {"raw": raw, "json": parsed}})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.post("/vlm")
 def vlm():
     try:
@@ -839,17 +1137,47 @@ def _rebuild_and_save_glb():
 def apply_change():
     try:
         spec = (request.get_json(force=True) or {}).get("json") or {}
+        action = (spec.get("action") or "").strip()
+        target = (spec.get("target_component") or "").strip().lower()
         params = spec.get("parameters") or {}
-        target = (spec.get("target_component") or "").strip()
 
-        _push_history()  # snapshot before change
+        # Normalize a common 'add wheel(s)' phrasing into wheels_per_side
+        if action == "add" and "wheel" in target:
+            cnt = params.get("count")
+            wps = params.get("wheels_per_side")
+            if wps is None and cnt is not None:
+                # if count is total wheels, convert to per side (round up)
+                try:
+                    c = int(cnt)
+                    params["wheels_per_side"] = max(1, (c + 1)//2)
+                except Exception:
+                    pass
+
+        _push_history()
         rv = Rover(stepper=_Stepper, electronics=_Electronics, sensors=_PanTilt, wheel=_ThisWheel)
         apply_params_to_rover(rv, params)
         _rebuild_and_save_glb()
 
-        return jsonify({"ok": True, "highlight_key": target})
+        return jsonify({"ok": True, "highlight_key": target or "wheel"})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# @app.post("/apply")
+# def apply_change():
+#     try:
+#         spec = (request.get_json(force=True) or {}).get("json") or {}
+#         params = spec.get("parameters") or {}
+#         target = (spec.get("target_component") or "").strip()
+
+#         _push_history()  # snapshot before change
+#         rv = Rover(stepper=_Stepper, electronics=_Electronics, sensors=_PanTilt, wheel=_ThisWheel)
+#         apply_params_to_rover(rv, params)
+#         _rebuild_and_save_glb()
+
+#         return jsonify({"ok": True, "highlight_key": target})
+#     except Exception as e:
+#         return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.post("/undo")
 def undo_change():
